@@ -1,0 +1,14 @@
+# Build output
+/bin/
+/dist/
+/ecis
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
