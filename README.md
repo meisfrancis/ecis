@@ -28,11 +28,7 @@ terminal for:
 
 ## Install
 
-```sh
-go install github.com/meisfrancis/ecis/cmd/ecis@latest
-```
-
-Or from a clone:
+Clone then:
 
 ```sh
 make build      # ./bin/ecis
