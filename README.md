@@ -384,6 +384,9 @@ loader and a key handler.
 
 - Cost Explorer figures lag real usage by up to 24 hours, as they do in the
   console. The estimator is a projection, not a bill.
+- The YAML view (`y`) renders the AWS API shape with unset fields omitted, so a
+  describe stays readable instead of filling the screen with nulls. Values that
+  carry meaning — `false`, `0` — are kept.
 - Per-task utilization needs Container Insights with enhanced observability.
 - Only the `awslogs` driver can be tailed. Containers on FireLens or another
   driver are listed, with an explanation instead of an empty log pane.
