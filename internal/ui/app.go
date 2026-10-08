@@ -213,24 +213,28 @@ func (a *App) SwitchContext(ctx context.Context, profile, region string) error {
 	return nil
 }
 
-// Run starts the background refreshers and enters the event loop.
+// Run starts the background refreshers and enters the event loop. It returns
+// once the loop has exited and the views have been torn down.
 func (a *App) Run(ctx context.Context) error {
 	ctx, a.cancel = context.WithCancel(ctx)
-	go a.refreshLoop(ctx)
 	defer a.cancel()
-	return a.Application.Run()
-}
+	go a.refreshLoop(ctx)
 
-// Stop tears the application down.
-func (a *App) Stop() {
-	if a.cancel != nil {
-		a.cancel()
-	}
+	err := a.Application.Run()
+
+	// tview drives input, drawing and queued updates on this goroutine, so the
+	// view stack has a single owner. Once Run has returned nothing else is
+	// touching it and the views can be stopped without synchronisation.
 	for _, c := range a.stack {
 		c.Stop()
 	}
-	a.Application.Stop()
+	return err
 }
+
+// Stop ends the session. It is safe to call from any goroutine — including a
+// signal handler — because tview's Stop is lock-protected and the view teardown
+// is left to Run, which owns the stack.
+func (a *App) Stop() { a.Application.Stop() }
 
 // refreshLoop keeps the header gauges current.
 func (a *App) refreshLoop(ctx context.Context) {
@@ -402,7 +406,8 @@ func GlobalHints() []Hint {
 	}
 }
 
-// Top returns the component on top of the stack.
+// Top returns the component on top of the stack. Like the rest of the stack
+// API, it must be called on the UI goroutine.
 func (a *App) Top() Component {
 	if len(a.stack) == 0 {
 		return nil

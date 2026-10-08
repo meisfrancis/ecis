@@ -122,9 +122,11 @@ func run() error {
 	}
 
 	// Ctrl-C at the terminal and SIGTERM should both tear the UI down cleanly.
+	// Stop is lock-protected and safe from any goroutine; queueing it would
+	// block forever, since it shuts down the loop that drains the queue.
 	go func() {
 		<-ctx.Done()
-		app.QueueUpdateDraw(func() { app.Stop() })
+		app.Stop()
 	}()
 
 	return app.Run(ctx)

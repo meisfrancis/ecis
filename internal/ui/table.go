@@ -50,6 +50,11 @@ func (r Row) Cell(i int) string {
 // built on. It keeps the full row set and derives the displayed set, so
 // filtering and sorting never lose data and a background refresh can replace
 // the contents without disturbing the cursor.
+//
+// Every method must be called on the UI goroutine: directly from a key handler,
+// or inside a QueueUpdateDraw callback. A loader that fetches rows in the
+// background hands them to Update from such a callback rather than calling it
+// from its own goroutine.
 type Table struct {
 	*tview.Table
 

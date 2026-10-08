@@ -54,6 +54,11 @@ type LogView struct {
 	err        error
 
 	cancel context.CancelFunc
+	// kick signals the poll goroutine to rewind the tail and refetch. It
+	// carries no payload: the window is read from the view so that coalescing
+	// two rapid rewinds applies the newest one, not the one that was queued
+	// first. Buffered so the UI goroutine never blocks on it.
+	kick chan struct{}
 }
 
 // NewLogView builds a log viewer over a tail. multi marks a tail that spans
@@ -69,6 +74,7 @@ func NewLogView(app *App, name, subject string, tail *awsx.LogTail, multi bool) 
 		since:      time.Duration(app.Config().LogSinceSeconds) * time.Second,
 		autoscroll: true,
 		timestamps: true,
+		kick:       make(chan struct{}, 1),
 	}
 	if tail != nil {
 		v.group = tail.Group
@@ -125,24 +131,45 @@ func (v *LogView) Stop() {
 	}
 }
 
-// Refresh implements Refreshable: rewinds and reloads the window.
+// Refresh implements Refreshable: reloads the current window from scratch.
 func (v *LogView) Refresh() {
+	v.rewind(v.Since())
+}
+
+// Since returns the length of history the view is showing.
+func (v *LogView) Since() time.Duration {
 	v.mu.Lock()
-	v.lines = nil
-	if v.tail != nil {
-		v.tail.Rewind(v.since)
-	}
+	defer v.mu.Unlock()
+	return v.since
+}
+
+// rewind clears the buffer and asks the poll goroutine to refetch over a new
+// window. The tail itself is only ever touched by that goroutine, so the rewind
+// is handed over rather than applied here.
+func (v *LogView) rewind(since time.Duration) {
+	v.mu.Lock()
+	v.since, v.lines, v.err = since, nil, nil
 	v.mu.Unlock()
-	v.render()
+
+	v.repaint()
+	select {
+	case v.kick <- struct{}{}:
+	default:
+		// A rewind is already pending; it will pick up the window just stored.
+	}
 }
 
 // SetFilter implements Filterable. Filtering is client-side over the buffered
 // lines so it applies instantly and does not re-query CloudWatch.
+//
+// This runs on the UI goroutine (the prompt calls it on every keystroke), so it
+// repaints directly: queueing the repaint would block waiting for the event loop
+// that is currently executing this call.
 func (v *LogView) SetFilter(q string) {
 	v.mu.Lock()
 	v.filter = q
 	v.mu.Unlock()
-	v.render()
+	v.repaint()
 }
 
 // Filter implements Filterable.
@@ -161,12 +188,19 @@ func (v *LogView) poll(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-v.kick:
+			if v.tail != nil {
+				v.tail.Rewind(v.Since())
+			}
+			v.fetch(ctx)
 		case <-ticker.C:
 			v.fetch(ctx)
 		}
 	}
 }
 
+// fetch pulls new events. It runs on the poll goroutine, which is the only
+// goroutine allowed to touch the tail.
 func (v *LogView) fetch(ctx context.Context) {
 	if v.tail == nil {
 		return
@@ -189,19 +223,23 @@ func (v *LogView) fetch(ctx context.Context) {
 	}
 	v.mu.Unlock()
 
-	if err != nil && !errors.Is(err, awsx.ErrNoLogGroup) {
-		v.app.QueueUpdateDraw(func() { v.app.Flash().Err(err) })
-	}
-	v.app.QueueUpdateDraw(func() { v.renderLocked() })
+	// A missing log group is explained in the body rather than the flash bar:
+	// for a task that has just started it is a normal, transient state.
+	flash := err != nil && !errors.Is(err, awsx.ErrNoLogGroup)
+	v.app.QueueUpdateDraw(func() {
+		if flash {
+			v.app.Flash().Err(err)
+		}
+		v.repaint()
+	})
 }
 
-func (v *LogView) render() {
-	v.app.QueueUpdateDraw(func() { v.renderLocked() })
-}
-
-func (v *LogView) renderLocked() {
+// repaint rebuilds the on-screen text from the buffer. It must be called on the
+// UI goroutine, either directly from a key handler or inside a queued update.
+func (v *LogView) repaint() {
 	v.mu.Lock()
 	lines, filter, timestamps, multi, err := v.lines, v.filter, v.timestamps, v.multi, v.err
+	autoscroll := v.autoscroll
 	v.mu.Unlock()
 
 	var b strings.Builder
@@ -243,7 +281,7 @@ func (v *LogView) renderLocked() {
 
 	v.SetText(b.String())
 	v.updateTitle()
-	if v.autoscroll {
+	if autoscroll {
 		v.ScrollToEnd()
 	}
 }
@@ -273,13 +311,13 @@ func shortStream(s string) string {
 
 func (v *LogView) updateTitle() {
 	v.mu.Lock()
-	count, filter, since := len(v.lines), v.filter, v.since
+	count, filter, since, autoscroll := len(v.lines), v.filter, v.since, v.autoscroll
 	v.mu.Unlock()
 
 	title := fmt.Sprintf(" [%s::b]Logs[-::-][%s](%s)[-][%s][%d][-]",
 		Hex(ColorTitle), Hex(ColorForeground), v.subject, Hex(ColorCPU), count)
 	title += fmt.Sprintf(" [%s]since %s[-]", Hex(ColorMuted), awsx.Duration(since))
-	if !v.autoscroll {
+	if !autoscroll {
 		title += fmt.Sprintf(" [%s]paused[-]", Hex(ColorWarn))
 	}
 	if filter != "" {
@@ -288,6 +326,8 @@ func (v *LogView) updateTitle() {
 	v.SetTitle(title + " ")
 }
 
+// keys handles the log view's own shortcuts. Everything here runs on the UI
+// goroutine, so repaints are direct rather than queued.
 func (v *LogView) keys(evt *tcell.EventKey) *tcell.EventKey {
 	switch evt.Key() {
 	case tcell.KeyCtrlS:
@@ -297,9 +337,13 @@ func (v *LogView) keys(evt *tcell.EventKey) *tcell.EventKey {
 
 	switch r := evt.Rune(); r {
 	case 's':
+		v.mu.Lock()
 		v.autoscroll = !v.autoscroll
-		v.app.Flash().Infof("autoscroll %s", onOff(v.autoscroll))
-		v.renderLocked()
+		autoscroll := v.autoscroll
+		v.mu.Unlock()
+
+		v.app.Flash().Infof("autoscroll %s", onOff(autoscroll))
+		v.repaint()
 		return nil
 	case 'w':
 		v.wrap = !v.wrap
@@ -307,8 +351,11 @@ func (v *LogView) keys(evt *tcell.EventKey) *tcell.EventKey {
 		v.app.Flash().Infof("wrap %s", onOff(v.wrap))
 		return nil
 	case 't':
+		v.mu.Lock()
 		v.timestamps = !v.timestamps
-		v.renderLocked()
+		v.mu.Unlock()
+
+		v.repaint()
 		return nil
 	case 'f':
 		v.full = !v.full
@@ -318,11 +365,16 @@ func (v *LogView) keys(evt *tcell.EventKey) *tcell.EventKey {
 		v.mu.Lock()
 		v.lines = nil
 		v.mu.Unlock()
-		v.renderLocked()
+
+		v.repaint()
 		v.app.Flash().Info("cleared")
 		return nil
 	case 'g':
+		v.mu.Lock()
 		v.autoscroll = false
+		v.mu.Unlock()
+
+		v.updateTitle()
 		v.ScrollToBeginning()
 		return nil
 	case 'G':
@@ -333,14 +385,10 @@ func (v *LogView) keys(evt *tcell.EventKey) *tcell.EventKey {
 			if r != w.Key {
 				continue
 			}
-			v.mu.Lock()
-			v.since, v.lines = w.Since, nil
-			if v.tail != nil {
-				v.tail.Rewind(w.Since)
-			}
-			v.mu.Unlock()
+			// rewind hands the new window to the poll goroutine, which owns the
+			// tail; mutating it from here would race with an in-flight fetch.
+			v.rewind(w.Since)
 			v.app.Flash().Infof("showing the last %s", w.Label)
-			v.renderLocked()
 			return nil
 		}
 	}
